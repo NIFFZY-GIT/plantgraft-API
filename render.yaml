@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: graft-compatibility-api
+    env: python
+    plan: free # or a paid plan
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app -b 0.0.0.0:$PORT
+    healthCheckPath: / # Or your health check endpoint
+    envVars:
+      - key: PYTHON_VERSION
+        value: '3.11' # Specify your Python version
+      # Add other environment variables if needed
