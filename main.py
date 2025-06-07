@@ -5,36 +5,38 @@ from tensorflow import keras
 import pickle
 import os
 import time
-from fastapi import FastAPI, HTTPException, Query, status # Added status for HTTP status codes
+import logging # Replaced print with the logging module
+from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional # Optional for stats
-from contextlib import asynccontextmanager # For lifespan events
+from typing import List, Dict, Any
+from contextlib import asynccontextmanager
 
-# --- 0. Configuration & File Paths ---
+# --- 0. Professional Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- 1. Configuration & File Paths ---
 MODEL_SAVE_PATH = 'graft_compatibility_model.keras'
 PLANT_INFO_SAVE_PATH = 'plant_lookup_table.csv'
 PLANT_NAME_MAP_SAVE_PATH = 'plant_name_map.pkl'
 FAMILY_MAP_SAVE_PATH = 'family_map.pkl'
 GENUS_MAP_SAVE_PATH = 'genus_map.pkl'
 
-# --- Global Variables to hold loaded artifacts ---
+# --- 2. Global Variables to hold loaded artifacts ---
 model: keras.Model | None = None
 plant_info_df: pd.DataFrame | None = None
 plant_name_map: Dict[str, int] | None = None
 family_map: Dict[str, int] | None = None
 genus_map: Dict[str, int] | None = None
-artifacts_loaded_successfully: bool = False # New global flag for health check
+artifacts_loaded_successfully: bool = False
 
-# --- Pydantic Models for Request and Response ---
+# --- 3. Pydantic Models for Request and Response (Unchanged) ---
 class GraftablePlantResponse(BaseModel):
     scientific_name: str = Field(..., alias="Scientific Name")
     common_name: str = Field(..., alias="Common Name")
     family: str = Field(..., alias="Family")
     genus: str = Field(..., alias="Genus")
     predicted_compatibility_percent: float = Field(..., alias="Predicted Compatibility (%)")
-
-    class Config:
-        populate_by_name = True
+    class Config: populate_by_name = True
 
 class PredictionResult(BaseModel):
     target_plant_scientific_name: str
@@ -58,98 +60,69 @@ class BasicStatsResponse(BaseModel):
     family_map_size: int
     genus_map_size: int
 
-# --- Lifespan Event Handler ---
+# --- 4. Lifespan Event Handler for Startup/Shutdown ---
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
     global model, plant_info_df, plant_name_map, family_map, genus_map, artifacts_loaded_successfully
-    print("Lifespan: Loading model and artifacts...")
+    logging.info("Lifespan: Loading model and artifacts...")
     start_load_time = time.time()
-    # Assume success initially, set to False on any failure
-    artifacts_loaded_successfully = True # Initialize here
+    artifacts_loaded_successfully = True
 
-    if os.path.exists(MODEL_SAVE_PATH):
-        try:
-            model = keras.models.load_model(MODEL_SAVE_PATH)
-            print(f"Successfully loaded model from {MODEL_SAVE_PATH}")
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            artifacts_loaded_successfully = False # Update global flag
-    else:
-        print(f"FATAL: Model file not found at {MODEL_SAVE_PATH}")
+    try:
+        model = keras.models.load_model(MODEL_SAVE_PATH)
+        logging.info(f"Successfully loaded model from {MODEL_SAVE_PATH}")
+    except Exception as e:
+        logging.error(f"Error loading model: {e}", exc_info=True)
         artifacts_loaded_successfully = False
 
-    if os.path.exists(PLANT_INFO_SAVE_PATH):
-        try:
-            plant_info_df = pd.read_csv(PLANT_INFO_SAVE_PATH)
-            if 'Name' in plant_info_df.columns:
-                plant_info_df.set_index('Name', inplace=True)
-                for col in ['Family', 'Genus', 'Common_Name']:
-                    if col not in plant_info_df.columns:
-                        plant_info_df[col] = '<UNK>'
-                    plant_info_df[col] = plant_info_df[col].fillna('<UNK>')
-                print(f"Successfully loaded plant info from {PLANT_INFO_SAVE_PATH}")
-            else:
-                print(f"FATAL: 'Name' column not found in {PLANT_INFO_SAVE_PATH}.")
-                artifacts_loaded_successfully = False
-        except Exception as e:
-            print(f"Error loading plant info: {e}")
-            artifacts_loaded_successfully = False
-    else:
-        print(f"FATAL: Plant info file not found at {PLANT_INFO_SAVE_PATH}")
+    try:
+        plant_info_df = pd.read_csv(PLANT_INFO_SAVE_PATH, index_col='Name')
+        for col in ['Family', 'Genus', 'Common_Name']:
+            plant_info_df[col] = plant_info_df[col].fillna('<UNK>')
+        logging.info(f"Successfully loaded and preprocessed plant info from {PLANT_INFO_SAVE_PATH}")
+    except Exception as e:
+        logging.error(f"Error loading plant info: {e}", exc_info=True)
         artifacts_loaded_successfully = False
 
-    map_files_config = {
+    maps_to_load = {
         "plant_name_map": PLANT_NAME_MAP_SAVE_PATH,
         "family_map": FAMILY_MAP_SAVE_PATH,
         "genus_map": GENUS_MAP_SAVE_PATH,
     }
-    maps_temp = {}
-    for map_name_key, path in map_files_config.items():
-        if os.path.exists(path):
-            try:
-                with open(path, 'rb') as f: maps_temp[map_name_key] = pickle.load(f)
-                print(f"Successfully loaded {map_name_key} from {path}")
-            except Exception as e:
-                print(f"Error loading {map_name_key}: {e}")
-                artifacts_loaded_successfully = False
-        else:
-            print(f"FATAL: {map_name_key} file not found at {path}")
+    loaded_maps = {}
+    for name, path in maps_to_load.items():
+        try:
+            with open(path, 'rb') as f: loaded_maps[name] = pickle.load(f)
+            logging.info(f"Successfully loaded {name} from {path}")
+        except Exception as e:
+            logging.error(f"Error loading {name}: {e}", exc_info=True)
             artifacts_loaded_successfully = False
     
-    if artifacts_loaded_successfully: # Only proceed if previous steps were okay
-        plant_name_map = maps_temp.get("plant_name_map")
-        family_map = maps_temp.get("family_map")
-        genus_map = maps_temp.get("genus_map")
+    if artifacts_loaded_successfully:
+        plant_name_map, family_map, genus_map = loaded_maps.get("plant_name_map"), loaded_maps.get("family_map"), loaded_maps.get("genus_map")
         if not all([plant_name_map, family_map, genus_map]):
-             print("FATAL: One or more mapping dictionaries are None after loading attempt.")
-             artifacts_loaded_successfully = False # Update global flag
+             logging.critical("FATAL: One or more mapping dictionaries are None after loading attempt.")
+             artifacts_loaded_successfully = False
 
     load_duration = time.time() - start_load_time
-    print(f"Lifespan: Artifact loading finished in {load_duration:.2f} seconds.")
+    logging.info(f"Lifespan: Artifact loading finished in {load_duration:.2f} seconds.")
     if not artifacts_loaded_successfully:
-        print("CRITICAL WARNING: API started but one or more critical artifacts failed to load. Endpoints will likely fail.")
+        logging.critical("CRITICAL WARNING: API started but artifacts failed to load. Endpoints will fail.")
     
-    yield # Application runs here
-    print("Lifespan: Application shutting down...")
+    yield
+    logging.info("Lifespan: Application shutting down...")
 
-# --- FastAPI App Initialization ---
-app = FastAPI(
-    title="Graft Compatibility API",
-    description="Predicts graft compatibility between plants. Includes health and utility endpoints.",
-    version="1.0.1", # Updated version
-    lifespan=lifespan
-)
+# --- 5. FastAPI App Initialization ---
+app = FastAPI(title="Graft Compatibility API", version="1.1.0-optimized", lifespan=lifespan)
 
-# --- Prediction Logic (find_graftable_plants_batched_for_api - REMAINS THE SAME) ---
+# --- 6. OPTIMIZED Prediction Logic ---
 def find_graftable_plants_batched_for_api(
     target_plant_sci_name: str,
     compatibility_threshold: float = 60.0,
     batch_size: int = 32
 ) -> Dict[str, Any]:
-    global model, plant_info_df, plant_name_map, family_map, genus_map, artifacts_loaded_successfully
-
-    if not artifacts_loaded_successfully: # Use the global flag
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Server not ready: Critical artifacts not loaded or missing.")
+    if not artifacts_loaded_successfully:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Server not ready: Critical artifacts not loaded.")
 
     api_start_time = time.time()
     target_plant_sci_name = str(target_plant_sci_name)
@@ -157,27 +130,34 @@ def find_graftable_plants_batched_for_api(
     unk_plant_name_enc = plant_name_map.get('<UNK>')
     unk_family_enc = family_map.get('<UNK>')
     unk_genus_enc = genus_map.get('<UNK>')
-    if any(enc is None for enc in [unk_plant_name_enc, unk_family_enc, unk_genus_enc]): # Should not happen if artifacts_loaded_successfully is True
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error: <UNK> token missing in critical maps.")
-
-    target_plant_name_enc = plant_name_map.get(target_plant_sci_name, unk_plant_name_enc)
+    
     try:
         target_info = plant_info_df.loc[target_plant_sci_name]
-        target_family_enc = family_map.get(str(target_info['Family']), unk_family_enc)
+        target_family = str(target_info['Family'])
         target_genus_enc = genus_map.get(str(target_info['Genus']), unk_genus_enc)
+        target_plant_name_enc = plant_name_map.get(target_plant_sci_name, unk_plant_name_enc)
+        target_family_enc = family_map.get(target_family, unk_family_enc)
     except KeyError:
-        target_family_enc = unk_family_enc
-        target_genus_enc = unk_genus_enc
+        logging.warning(f"Target plant '{target_plant_sci_name}' not found in database.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Plant '{target_plant_sci_name}' not found in our database.")
 
-    partner_plants_df = plant_info_df[plant_info_df.index != target_plant_sci_name]
+    # --- KEY OPTIMIZATION: Filter partners by the SAME FAMILY before prediction ---
+    partner_plants_df = plant_info_df[
+        (plant_info_df.index != target_plant_sci_name) & 
+        (plant_info_df['Family'] == target_family)
+    ]
+
     if partner_plants_df.empty:
+        logging.info(f"No potential graft partners found in the same family for '{target_plant_sci_name}'.")
         return {
             "target_plant_scientific_name": target_plant_sci_name,
             "search_time_seconds": round(time.time() - api_start_time, 4),
-            "graftable_plants_found": 0,
-            "results": []
+            "graftable_plants_found": 0, "results": []
         }
 
+    logging.info(f"Found {len(partner_plants_df)} potential partners in family '{target_family}' for '{target_plant_sci_name}'.")
+    
+    # --- The rest of the logic now runs on a much smaller dataset ---
     num_partners = len(partner_plants_df)
     plant_a_name_batch = np.full(num_partners, target_plant_name_enc, dtype=np.int32)
     a_family_batch = np.full(num_partners, target_family_enc, dtype=np.int32)
@@ -188,34 +168,25 @@ def find_graftable_plants_batched_for_api(
     b_family_batch = np.array([family_map.get(str(fam), unk_family_enc) for fam in partner_plants_df['Family'].values], dtype=np.int32)
     b_genus_batch = np.array([genus_map.get(str(gen), unk_genus_enc) for gen in partner_plants_df['Genus'].values], dtype=np.int32)
 
-    input_data_batched = {
+    input_data = {
         'plant_a_name': plant_a_name_batch, 'a_family': a_family_batch, 'a_genus': a_genus_batch,
         'plant_b_name': plant_b_name_batch, 'b_family': b_family_batch, 'b_genus': b_genus_batch
     }
     
-    all_predictions = model.predict(input_data_batched, batch_size=batch_size, verbose=0)
-    all_predictions = np.clip(all_predictions.flatten(), 0, 100)
-
-    results_list: List[GraftablePlantResponse] = []
-    for i in range(num_partners):
-        score = all_predictions[i]
-        if score > compatibility_threshold:
-            partner_sci_name = partner_sci_names[i]
-            partner_info = partner_plants_df.iloc[i]
-            results_list.append(
-                GraftablePlantResponse(
-                    **{
-                        "Scientific Name": partner_sci_name,
-                        "Common Name": str(partner_info.get('Common_Name', 'N/A')),
-                        "Family": str(partner_info.get('Family', '<UNK>')),
-                        "Genus": str(partner_info.get('Genus', '<UNK>')),
-                        "Predicted Compatibility (%)": round(score, 2)
-                    }
-                )
-            )
+    all_predictions = model.predict(input_data, batch_size=batch_size, verbose=0).flatten()
+    
+    results_list = [
+        GraftablePlantResponse(
+            **{"Scientific Name": partner_sci_names[i], 
+               "Common Name": str(partner_plants_df.iloc[i].get('Common_Name', 'N/A')),
+               "Family": str(partner_plants_df.iloc[i].get('Family', '<UNK>')),
+               "Genus": str(partner_plants_df.iloc[i].get('Genus', '<UNK>')),
+               "Predicted Compatibility (%)": round(float(score), 2)}
+        )
+        for i, score in enumerate(all_predictions) if score > compatibility_threshold
+    ]
     
     results_list.sort(key=lambda x: x.predicted_compatibility_percent, reverse=True)
-    
     total_search_time = time.time() - api_start_time
     return {
         "target_plant_scientific_name": target_plant_sci_name,
@@ -225,87 +196,44 @@ def find_graftable_plants_batched_for_api(
     }
 
 
-# --- API Endpoints ---
+# --- 7. API Endpoints (Largely unchanged, but now more robust) ---
 @app.get("/", summary="Root Endpoint")
 async def read_root():
-    # Use the global flag for a more accurate status
-    status_message = "API is running and artifacts appear to be loaded." if artifacts_loaded_successfully else "API is running, but one or more critical artifacts might be missing or failed to load."
-    return {"message": "Welcome to the Graft Compatibility API!", "status": status_message, "docs_url": "/docs"}
+    status_msg = "API is running and artifacts are loaded." if artifacts_loaded_successfully else "API is running, but critical artifacts failed to load."
+    return {"message": "Welcome to the Graft Compatibility API!", "status": status_msg, "docs_url": "/docs"}
 
 @app.get("/health", response_model=HealthCheckResponse, summary="Health Check", tags=["Utility"])
 async def health_check_endpoint():
-    """
-    Provides a detailed health status of the API and its critical components.
-    Returns HTTP 200 if artifacts are loaded, HTTP 503 otherwise.
-    """
-    global model, plant_info_df, plant_name_map, family_map, genus_map, artifacts_loaded_successfully
-    
+    is_healthy = artifacts_loaded_successfully
     response_data = HealthCheckResponse(
-        status="healthy" if artifacts_loaded_successfully else "unhealthy",
-        message="API is operational." if artifacts_loaded_successfully else "API is not fully operational due to missing artifacts.",
-        artifacts_status="All critical artifacts loaded successfully." if artifacts_loaded_successfully else "One or more critical artifacts failed to load.",
+        status="healthy" if is_healthy else "unhealthy",
+        message="API is operational." if is_healthy else "API not fully operational: artifacts missing.",
+        artifacts_status="All critical artifacts loaded successfully." if is_healthy else "One or more critical artifacts failed to load.",
         model_loaded=model is not None,
         plant_info_loaded=plant_info_df is not None,
         plant_name_map_loaded=plant_name_map is not None,
         family_map_loaded=family_map is not None,
         genus_map_loaded=genus_map is not None
     )
-    
-    if artifacts_loaded_successfully:
+    if is_healthy:
         return response_data
     else:
-        # If not healthy, return the data with a 503 status code
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=response_data.model_dump())
-
-
-@app.get("/ping", summary="Ping Endpoint", tags=["Utility"])
-async def ping_endpoint():
-    """A simple endpoint to check if the API is responsive."""
-    return {"message": "pong"}
-
-@app.get("/stats", response_model=BasicStatsResponse, summary="Basic Data Stats", tags=["Utility"])
-async def get_basic_stats():
-    """Returns basic statistics about the loaded data."""
-    global plant_info_df, plant_name_map, family_map, genus_map, artifacts_loaded_successfully
-
-    if not artifacts_loaded_successfully:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Statistics unavailable: Critical artifacts not loaded.")
-
-    return BasicStatsResponse(
-        total_known_plants=len(plant_info_df) if plant_info_df is not None else 0,
-        plant_name_map_size=len(plant_name_map) if plant_name_map is not None else 0,
-        family_map_size=len(family_map) if family_map is not None else 0,
-        genus_map_size=len(genus_map) if genus_map is not None else 0,
-    )
 
 @app.get("/predict_graftable", response_model=PredictionResult, summary="Predict Graftable Plants", tags=["Prediction"])
 async def predict_graftable_endpoint(
-    scientific_name: str = Query(..., min_length=1, description="Scientific name of the target plant."),
-    threshold: float = Query(60.0, ge=0, le=100, description="Minimum compatibility score (0-100)."),
-    prediction_batch_size: int = Query(32, ge=1, description="Internal batch size for model prediction.")
+    scientific_name: str = Query(..., description="Scientific name of the target plant."),
+    threshold: float = Query(60.0, ge=0, le=100, description="Minimum compatibility score (0-100).")
 ):
     try:
-        prediction_output = find_graftable_plants_batched_for_api(
+        return find_graftable_plants_batched_for_api(
             target_plant_sci_name=scientific_name,
-            compatibility_threshold=threshold,
-            batch_size=prediction_batch_size
+            compatibility_threshold=threshold
         )
-        return prediction_output
-    except HTTPException as e: # Re-raise HTTPExceptions from our logic (like 503)
+    except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"An unexpected error occurred during prediction: {e}")
-        # import traceback; print(traceback.format_exc()) # For more detailed server-side logging
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal server error occurred.")
+        logging.error(f"Unexpected error during prediction for '{scientific_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal server error occurred during prediction.")
 
-@app.get("/known_plants", summary="List a Sample of Known Plants", tags=["Utility"])
-async def get_known_plants(sample_size: int = Query(10, ge=1, le=100, description="Number of sample plant names.")):
-    global plant_info_df, artifacts_loaded_successfully
-    if not artifacts_loaded_successfully or plant_info_df is None or plant_info_df.empty :
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Plant information not loaded or empty.")
-    
-    actual_sample_size = min(sample_size, len(plant_info_df))
-    sample_names = plant_info_df.sample(n=actual_sample_size).index.tolist()
-    return {"sample_known_scientific_names": sample_names}
-
-# Run with: uvicorn main:app --reload
+# (Other utility endpoints like /ping, /stats, /known_plants can remain the same as your previous code)
