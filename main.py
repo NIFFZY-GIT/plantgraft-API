@@ -1,3 +1,5 @@
+# main.py
+
 import pandas as pd
 import numpy as np
 import tensorflow as tf
@@ -5,21 +7,26 @@ from tensorflow import keras
 import pickle
 import os
 import time
-import logging # Replaced print with the logging module
+import logging
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
 from contextlib import asynccontextmanager
+from fastapi.concurrency import run_in_threadpool
 
 # --- 0. Professional Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- 1. Configuration & File Paths ---
-MODEL_SAVE_PATH = 'graft_compatibility_model.keras'
-PLANT_INFO_SAVE_PATH = 'plant_lookup_table.csv'
-PLANT_NAME_MAP_SAVE_PATH = 'plant_name_map.pkl'
-FAMILY_MAP_SAVE_PATH = 'family_map.pkl'
-GENUS_MAP_SAVE_PATH = 'genus_map.pkl'
+# Get the persistent disk path from an environment variable. 
+# Default to the current directory '.' if the variable isn't set (for local testing).
+PERSISTENT_DATA_PATH = os.getenv('RENDER_DISK_PATH', '.')
+
+MODEL_SAVE_PATH = os.path.join(PERSISTENT_DATA_PATH, 'graft_compatibility_model.keras')
+PLANT_INFO_SAVE_PATH = os.path.join(PERSISTENT_DATA_PATH, 'plant_lookup_table.csv')
+PLANT_NAME_MAP_SAVE_PATH = os.path.join(PERSISTENT_DATA_PATH, 'plant_name_map.pkl')
+FAMILY_MAP_SAVE_PATH = os.path.join(PERSISTENT_DATA_PATH, 'family_map.pkl')
+GENUS_MAP_SAVE_PATH = os.path.join(PERSISTENT_DATA_PATH, 'genus_map.pkl')
 
 # --- 2. Global Variables to hold loaded artifacts ---
 model: keras.Model | None = None
@@ -29,7 +36,7 @@ family_map: Dict[str, int] | None = None
 genus_map: Dict[str, int] | None = None
 artifacts_loaded_successfully: bool = False
 
-# --- 3. Pydantic Models for Request and Response (Unchanged) ---
+# --- 3. Pydantic Models for Request and Response ---
 class GraftablePlantResponse(BaseModel):
     scientific_name: str = Field(..., alias="Scientific Name")
     common_name: str = Field(..., alias="Common Name")
@@ -54,11 +61,12 @@ class HealthCheckResponse(BaseModel):
     family_map_loaded: bool
     genus_map_loaded: bool
 
-class BasicStatsResponse(BaseModel):
-    total_known_plants: int
-    plant_name_map_size: int
-    family_map_size: int
-    genus_map_size: int
+# --- NEW Pydantic Model for Adding Plant Metadata ---
+class PlantMetadata(BaseModel):
+    scientific_name: str = Field(..., description="The scientific name, which will be the primary key.")
+    common_name: str | None = Field("N/A", description="The common name of the plant.")
+    family: str | None = Field("<UNK>", description="The family of the plant.")
+    genus: str | None = Field("<UNK>", description="The genus of the plant.")
 
 # --- 4. Lifespan Event Handler for Startup/Shutdown ---
 @asynccontextmanager
@@ -113,7 +121,7 @@ async def lifespan(app_instance: FastAPI):
     logging.info("Lifespan: Application shutting down...")
 
 # --- 5. FastAPI App Initialization ---
-app = FastAPI(title="Graft Compatibility API", version="1.1.0-optimized", lifespan=lifespan)
+app = FastAPI(title="Graft Compatibility API", version="1.2.0-self-improving", lifespan=lifespan)
 
 # --- 6. OPTIMIZED Prediction Logic ---
 def find_graftable_plants_batched_for_api(
@@ -127,24 +135,33 @@ def find_graftable_plants_batched_for_api(
     api_start_time = time.time()
     target_plant_sci_name = str(target_plant_sci_name)
 
+    # Reload the plant info dataframe inside the function to get the most recent data
+    # This is a simple way to get updates without a full server restart
+    try:
+        current_plant_info_df = pd.read_csv(PLANT_INFO_SAVE_PATH, index_col='Name')
+        for col in ['Family', 'Genus', 'Common_Name']:
+            current_plant_info_df[col] = current_plant_info_df[col].fillna('<UNK>')
+    except FileNotFoundError:
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Plant lookup table file not found on server.")
+
     unk_plant_name_enc = plant_name_map.get('<UNK>')
     unk_family_enc = family_map.get('<UNK>')
     unk_genus_enc = genus_map.get('<UNK>')
     
     try:
-        target_info = plant_info_df.loc[target_plant_sci_name]
+        target_info = current_plant_info_df.loc[target_plant_sci_name]
         target_family = str(target_info['Family'])
         target_genus_enc = genus_map.get(str(target_info['Genus']), unk_genus_enc)
         target_plant_name_enc = plant_name_map.get(target_plant_sci_name, unk_plant_name_enc)
         target_family_enc = family_map.get(target_family, unk_family_enc)
     except KeyError:
-        logging.warning(f"Target plant '{target_plant_sci_name}' not found in database.")
+        logging.warning(f"Target plant '{target_plant_sci_name}' not found in database for prediction.")
+        # This is the specific error the Flutter app will look for
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Plant '{target_plant_sci_name}' not found in our database.")
 
-    # --- KEY OPTIMIZATION: Filter partners by the SAME FAMILY before prediction ---
-    partner_plants_df = plant_info_df[
-        (plant_info_df.index != target_plant_sci_name) & 
-        (plant_info_df['Family'] == target_family)
+    partner_plants_df = current_plant_info_df[
+        (current_plant_info_df.index != target_plant_sci_name) & 
+        (current_plant_info_df['Family'] == target_family)
     ]
 
     if partner_plants_df.empty:
@@ -157,7 +174,6 @@ def find_graftable_plants_batched_for_api(
 
     logging.info(f"Found {len(partner_plants_df)} potential partners in family '{target_family}' for '{target_plant_sci_name}'.")
     
-    # --- The rest of the logic now runs on a much smaller dataset ---
     num_partners = len(partner_plants_df)
     plant_a_name_batch = np.full(num_partners, target_plant_name_enc, dtype=np.int32)
     a_family_batch = np.full(num_partners, target_family_enc, dtype=np.int32)
@@ -195,9 +211,8 @@ def find_graftable_plants_batched_for_api(
         "results": results_list
     }
 
-
-# --- 7. API Endpoints (Largely unchanged, but now more robust) ---
-@app.get("/", summary="Root Endpoint")
+# --- 7. API Endpoints ---
+@app.get("/", summary="Root Endpoint", tags=["Utility"])
 async def read_root():
     status_msg = "API is running and artifacts are loaded." if artifacts_loaded_successfully else "API is running, but critical artifacts failed to load."
     return {"message": "Welcome to the Graft Compatibility API!", "status": status_msg, "docs_url": "/docs"}
@@ -236,4 +251,58 @@ async def predict_graftable_endpoint(
         logging.error(f"Unexpected error during prediction for '{scientific_name}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal server error occurred during prediction.")
 
-# (Other utility endpoints like /ping, /stats, /known_plants can remain the same as your previous code)
+# --- NEW ENDPOINT: Add Plant Metadata ---
+@app.post("/plants/add_metadata", status_code=status.HTTP_201_CREATED, summary="Add New Plant Metadata", tags=["Data Management"])
+async def add_plant_metadata(data: PlantMetadata):
+    """
+    Adds a new plant's metadata to the plant_lookup_table.csv.
+    This makes an unknown plant available for future compatibility predictions.
+    It does NOT add training data, only the plant's identity.
+    """
+    if not os.path.exists(PLANT_INFO_SAVE_PATH):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"The plant lookup table was not found at {PLANT_INFO_SAVE_PATH}."
+        )
+
+    def append_to_csv():
+        # This function runs in a separate thread to avoid blocking
+        try:
+            # Use a file lock or another mechanism if high concurrency is expected. For now, this is sufficient.
+            df = pd.read_csv(PLANT_INFO_SAVE_PATH, index_col='Name')
+            
+            if data.scientific_name.lower() in [idx.lower() for idx in df.index]:
+                logging.info(f"Plant metadata for '{data.scientific_name}' already exists. No action taken.")
+                return "already_exists"
+
+            new_row = pd.DataFrame([{
+                'Name': data.scientific_name,
+                'Family': data.family or '<UNK>',
+                'Genus': data.genus or '<UNK>',
+                'Common_Name': data.common_name or 'N/A'
+            }]).set_index('Name')
+
+            new_row.to_csv(PLANT_INFO_SAVE_PATH, mode='a', header=False)
+            logging.info(f"Successfully added metadata for new plant: {data.scientific_name}")
+            return "added_successfully"
+        except Exception as e:
+            logging.error(f"Failed to write metadata to {PLANT_INFO_SAVE_PATH}: {e}", exc_info=True)
+            raise e
+
+    try:
+        result = await run_in_threadpool(append_to_csv)
+        if result == "already_exists":
+            return {
+                "message": "Plant metadata already exists.",
+                "scientific_name": data.scientific_name
+            }
+        
+        return {
+            "message": "Plant metadata added successfully.",
+            "data_added": data.model_dump()
+        }
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while saving the new plant metadata."
+        )
