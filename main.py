@@ -28,7 +28,6 @@ GENUS_MAP_SAVE_PATH = os.path.join(PERSISTENT_DATA_PATH, 'genus_map.pkl')
 
 # --- 2. Global Variables ---
 model: keras.Model | None = None
-plant_info_df: pd.DataFrame | None = None
 plant_name_map: Dict[str, int] | None = None
 family_map: Dict[str, int] | None = None
 genus_map: Dict[str, int] | None = None
@@ -48,6 +47,7 @@ class PredictionResult(BaseModel):
     search_time_seconds: float
     graftable_plants_found: int
     results: List[GraftablePlantResponse]
+    other_notable_results: List[GraftablePlantResponse] # For top 5
 
 class HealthCheckResponse(BaseModel):
     status: str
@@ -65,20 +65,23 @@ class PlantMetadata(BaseModel):
     family: str | None = Field("<UNK>", description="The family of the plant.")
     genus: str | None = Field("<UNK>", description="The genus of the plant.")
 
+class AddPlantResponse(BaseModel):
+    message: str
+    scientific_name: str | None = None
+    data_added: PlantMetadata | None = None
+
 # --- 4. Lifespan Event Handler ---
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
     global model, plant_name_map, family_map, genus_map, artifacts_loaded_successfully
     logging.info("Lifespan: Loading model and artifacts...")
     artifacts_loaded_successfully = True
-
     try:
         model = keras.models.load_model(MODEL_SAVE_PATH)
         logging.info(f"Successfully loaded model from {MODEL_SAVE_PATH}")
     except Exception as e:
         logging.error(f"Error loading model: {e}", exc_info=True)
         artifacts_loaded_successfully = False
-
     maps_to_load = { "plant_name_map": PLANT_NAME_MAP_SAVE_PATH, "family_map": FAMILY_MAP_SAVE_PATH, "genus_map": GENUS_MAP_SAVE_PATH, }
     loaded_maps = {}
     for name, path in maps_to_load.items():
@@ -88,21 +91,19 @@ async def lifespan(app_instance: FastAPI):
         except Exception as e:
             logging.error(f"Error loading {name}: {e}", exc_info=True)
             artifacts_loaded_successfully = False
-    
     if artifacts_loaded_successfully:
         plant_name_map, family_map, genus_map = loaded_maps.get("plant_name_map"), loaded_maps.get("family_map"), loaded_maps.get("genus_map")
-    
     yield
     logging.info("Lifespan: Application shutting down...")
 
 # --- 5. FastAPI App Initialization ---
-app = FastAPI(title="Graft Compatibility API", version="1.6.0-corrected", lifespan=lifespan)
+app = FastAPI(title="Graft Compatibility API", version="2.0.0-final", lifespan=lifespan)
 
-# --- 6. PREDICTION LOGIC AND ENDPOINT (CORRECTED) ---
+# --- 6. PREDICTION LOGIC AND ENDPOINT ---
 @app.get("/predict_graftable/{scientific_name}", response_model=PredictionResult, summary="Predict Graftable Plants", tags=["Prediction"])
 async def predict_graftable_endpoint(
-    scientific_name: str, # This is now a PATH parameter
-    threshold: float = Query(60.0, ge=0, le=100, description="Minimum compatibility score (0-100).")
+    scientific_name: str,
+    threshold: float = Query(65.0, ge=0, le=100, description="Minimum compatibility score for 'highly compatible' results.")
 ):
     if not artifacts_loaded_successfully:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Server not ready: Critical artifacts not loaded.")
@@ -114,7 +115,6 @@ async def predict_graftable_endpoint(
     except FileNotFoundError:
          raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Plant lookup table file not found on server.")
 
-    # FastAPI automatically URL-decodes path parameters.
     try:
         target_info = current_plant_info_df.loc[scientific_name]
         target_family = str(target_info['Family'])
@@ -128,7 +128,7 @@ async def predict_graftable_endpoint(
     partner_plants_df = current_plant_info_df[ (current_plant_info_df.index != scientific_name) & (current_plant_info_df['Family'] == target_family) ]
 
     if partner_plants_df.empty:
-        return { "target_plant_scientific_name": scientific_name, "search_time_seconds": round(time.time() - api_start_time, 4), "graftable_plants_found": 0, "results": [] }
+        return { "target_plant_scientific_name": scientific_name, "search_time_seconds": round(time.time() - api_start_time, 4), "graftable_plants_found": 0, "results": [], "other_notable_results": [] }
 
     num_partners = len(partner_plants_df)
     input_data = {
@@ -140,27 +140,34 @@ async def predict_graftable_endpoint(
         'b_genus': np.array([genus_map.get(str(gen), genus_map.get('<UNK>')) for gen in partner_plants_df['Genus'].values], dtype=np.int32)
     }
     
-    # Model likely predicts a score from 0.0 to 1.0
     all_predictions = model.predict(input_data, batch_size=32, verbose=0).flatten()
     
-    results_list = []
+    all_results = []
     for i, score in enumerate(all_predictions):
-        compatibility_percent = score * 100
-        if compatibility_percent > threshold:
-            results_list.append(
-                GraftablePlantResponse(
-                    **{
-                        "Scientific Name": partner_plants_df.index[i],
-                        "Common Name": str(partner_plants_df.iloc[i].get('Common_Name', 'N/A')),
-                        "Family": str(partner_plants_df.iloc[i].get('Family', '<UNK>')),
-                        "Genus": str(partner_plants_df.iloc[i].get('Genus', '<UNK>')),
-                        "Predicted Compatibility (%)": round(float(compatibility_percent), 2)
-                    }
-                )
+        all_results.append(
+            GraftablePlantResponse(
+                **{
+                    "Scientific Name": partner_plants_df.index[i],
+                    "Common Name": str(partner_plants_df.iloc[i].get('Common_Name', 'N/A')),
+                    "Family": str(partner_plants_df.iloc[i].get('Family', '<UNK>')),
+                    "Genus": str(partner_plants_df.iloc[i].get('Genus', '<UNK>')),
+                    "Predicted Compatibility (%)": round(float(score * 100), 2)
+                }
             )
+        )
     
-    results_list.sort(key=lambda x: x.predicted_compatibility_percent, reverse=True)
-    return { "target_plant_scientific_name": scientific_name, "search_time_seconds": round(time.time() - api_start_time, 4), "graftable_plants_found": len(results_list), "results": results_list }
+    all_results.sort(key=lambda x: x.predicted_compatibility_percent, reverse=True)
+    
+    high_compatibility_results = [p for p in all_results if p.predicted_compatibility_percent > threshold]
+    other_results = [p for p in all_results if p.predicted_compatibility_percent <= threshold]
+
+    return { 
+        "target_plant_scientific_name": scientific_name, 
+        "search_time_seconds": round(time.time() - api_start_time, 4), 
+        "graftable_plants_found": len(high_compatibility_results), 
+        "results": high_compatibility_results,
+        "other_notable_results": other_results[:5]
+    }
 
 # --- 7. UTILITY AND DATA MANAGEMENT ENDPOINTS ---
 @app.get("/", summary="Root Endpoint", tags=["Utility"], include_in_schema=False)
@@ -171,19 +178,17 @@ async def read_root():
 async def health_check_endpoint():
     return HealthCheckResponse(status="healthy" if artifacts_loaded_successfully else "unhealthy", message="API is operational." if artifacts_loaded_successfully else "API not fully operational: artifacts missing.", artifacts_status="Loaded" if artifacts_loaded_successfully else "Not Loaded", model_loaded=model is not None, plant_info_loaded=os.path.exists(PLANT_INFO_SAVE_PATH), plant_name_map_loaded=plant_name_map is not None, family_map_loaded=family_map is not None, genus_map_loaded=genus_map is not None)
 
-@app.post("/plants/add_metadata", status_code=status.HTTP_201_CREATED, summary="Add New Plant Metadata", tags=["Data Management"])
+@app.post("/plants/add_metadata", status_code=status.HTTP_201_CREATED, summary="Add New Plant Metadata", tags=["Data Management"], response_model=AddPlantResponse)
 async def add_plant_metadata(data: PlantMetadata):
     def efficient_append_and_check():
         try:
-            # Create file with header if it doesn't exist
             if not os.path.exists(PLANT_INFO_SAVE_PATH):
                  with open(PLANT_INFO_SAVE_PATH, mode='w', encoding='utf-8', newline='') as f:
                     csv.writer(f).writerow(['Name', 'Family', 'Genus', 'Common_Name'])
             
-            # More robust duplicate check
             with open(PLANT_INFO_SAVE_PATH, mode='r', encoding='utf-8', newline='') as f:
                 reader = csv.reader(f)
-                next(reader, None) # Skip header
+                next(reader, None)
                 for row in reader:
                     if row and row[0].strip().lower() == data.scientific_name.strip().lower():
                         return "already_exists"
@@ -200,8 +205,7 @@ async def add_plant_metadata(data: PlantMetadata):
     try:
         result = await run_in_threadpool(efficient_append_and_check)
         if result == "already_exists":
-            # Return 200 OK instead of an error if it already exists, as the client's goal is met.
             return {"message": "Plant metadata already exists.", "scientific_name": data.scientific_name}
-        return {"message": "Plant metadata added successfully.", "data_added": data.model_dump()}
+        return {"message": "Plant metadata added successfully.", "data_added": data}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal server error occurred: {str(e)}")
