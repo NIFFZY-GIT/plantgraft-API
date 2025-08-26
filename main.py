@@ -141,11 +141,6 @@ async def predict_graftable_endpoint(
     }
     
     all_predictions = model.predict(input_data, batch_size=32, verbose=0).flatten()
-
-    # --- FIX: Clip model output to the valid probability range [0, 1] ---
-    # The model might output values outside this range (e.g., > 1.0 or < 0.0).
-    # Clipping ensures the final percentage is correctly bounded between 0% and 100%.
-    all_predictions = np.clip(all_predictions, 0, 1)
     
     all_results = []
     for i, score in enumerate(all_predictions):
@@ -156,7 +151,10 @@ async def predict_graftable_endpoint(
                     "Common Name": str(partner_plants_df.iloc[i].get('Common_Name', 'N/A')),
                     "Family": str(partner_plants_df.iloc[i].get('Family', '<UNK>')),
                     "Genus": str(partner_plants_df.iloc[i].get('Genus', '<UNK>')),
-                    "Predicted Compatibility (%)": round(float(score * 100), 2)
+                    # --- FIX START ---
+                    # Removed "* 100" as the model likely outputs a 0-100 score directly.
+                    "Predicted Compatibility (%)": round(float(score), 2)
+                    # --- FIX END ---
                 }
             )
         )
