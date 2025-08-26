@@ -141,6 +141,11 @@ async def predict_graftable_endpoint(
     }
     
     all_predictions = model.predict(input_data, batch_size=32, verbose=0).flatten()
+
+    # --- FIX: Clip model output to the valid probability range [0, 1] ---
+    # The model might output values outside this range (e.g., > 1.0 or < 0.0).
+    # Clipping ensures the final percentage is correctly bounded between 0% and 100%.
+    all_predictions = np.clip(all_predictions, 0, 1)
     
     all_results = []
     for i, score in enumerate(all_predictions):
